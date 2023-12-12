@@ -6,6 +6,7 @@ import functools
 import ipaddress
 import json
 import logging
+import os
 import sys
 import urllib3
 
@@ -268,10 +269,22 @@ def parse_args():
     unifi = parser.add_argument_group()
     unifi.add_argument('--unifi-interface', default='wan')
     unifi.add_argument('--unifi-hostname', default='unifi')
-    unifi.add_argument('--unifi-username', required=True)
-    unifi.add_argument('--unifi-password', required=True)
     unifi.add_argument('--unifi-sitename', default='default')
     unifi.add_argument('--unifi-insecure', action='store_true')
+
+    env_unifi_username = os.environ.get('UNIFI_OPERATOR_UNIFI_USERNAME')
+    unifi.add_argument(
+        '--unifi-username',
+        default=env_unifi_username,
+        required=not env_unifi_username,
+    )
+
+    env_unifi_password = os.environ.get('UNIFI_OPERATOR_UNIFI_PASSWORD')
+    unifi.add_argument(
+        '--unifi-password',
+        default=env_unifi_password,
+        required=not env_unifi_password,
+    )
 
     args = parser.parse_args()
 
