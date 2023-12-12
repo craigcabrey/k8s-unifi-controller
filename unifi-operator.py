@@ -1,15 +1,31 @@
 #!/usr/bin/env python3
 
 import argparse
+import enum
 import functools
 import ipaddress
 import json
+import logging
 import sys
+import urllib3
 
 
 import kubernetes
 import requests
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format='[{asctime}] {levelname:<8} {message}',
+    style='{',
+)
+logger.setLevel(logging.INFO)
+
+
+class EventType(enum.Enum):
+    Added = 'ADDED'
+    Deleted = 'DELETED'
 
 
 class Unifi:
@@ -25,6 +41,7 @@ class Unifi:
         hostname,
         dry_run=False,
         site=None,
+        wan_interface=None,
     ):
         self._csrf = None
         self._username = username
@@ -36,17 +53,34 @@ class Unifi:
         if not site:
             site = 'default'
 
-        self._site = site
+        if not wan_interface:
+            wan_interface = 'wan'
 
-    def create_rule(self, rule, dry_run=False):
+        self._site = site
+        self._wan_interface = wan_interface
+
+    def create_port_forward_rule(self, rule):
+        rule['pfwd_interface'] = self._wan_interface
+
         if self._dry_run:
-            print(
-                'Would create port forward rule: {}'
-                .format(json.dumps(rule, indent=2))
+            logger.debug(
+                'Would create port forward rule: %s',
+                json.dumps(rule, indent=2),
             )
             return True
 
+        logger.info('Creating new port forward rule: %s', rule)
         return self._query(self._session.post, 'rest/portforward', rule)
+
+    def delete_port_forward_rule(self, rule):
+        rule_id = rule.pop('_id')
+
+        if self._dry_run:
+            logger.debug('Would delete port forward rule %s', rule_id)
+            return True
+
+        logger.info('Delete port forward rule: %s', rule_id)
+        return self._query(self._session.delete, f'rest/portforward/{rule_id}')
 
     def login(self):
         response = self._session.post(
@@ -63,25 +97,28 @@ class Unifi:
     def rules(self):
         return self._session.get(
             self._endpoint('rest/portforward'),
-            headers=REQUEST_HEADERS,
+            headers=self.REQUEST_HEADERS,
         ).json()['data']
 
-    def update_rule(self, rule):
+    def update_port_forward_rule(self, rule):
         rule_id = rule.pop('_id')
+        rule['pfwd_interface'] = self._wan_interface
 
         if self._dry_run:
-            print(
-                'Would update port forward rule {rule_id}: {rule}'
-                .format(rule_id=rule_id, rule=json.dumps(rule, indent=2))
+            logger.debug(
+                'Would update port forward rule %s: %s',
+                rule_id,
+                json.dumps(rule, indent=2),
             )
             return True
 
+        logger.info('Updating port forward rule %s: %s', rule_id, rule)
         return self._query(self._session.put, f'rest/portforward/{rule_id}', rule)
 
     def _endpoint(self, endpoint):
         return f'{self._base_url}/proxy/network/api/s/{self._site}/{endpoint}'
 
-    def _query(self, method, endpoint, payload):
+    def _query(self, method, endpoint, payload=None):
         return method(
             self._endpoint('rest/portforward'),
             headers=dict(self.REQUEST_HEADERS, **{'X-CSRF-TOKEN': self._csrf}),
@@ -102,7 +139,7 @@ def service_filter(service, label):
 
 
 def merge_rules(existing_rules, generated_rules):
-    port_forward_rules ={
+    port_forward_rules = {
         port_configuration['dst_port']: port_configuration
         for port_configuration in existing_rules
     }
@@ -130,69 +167,82 @@ def merge_rules(existing_rules, generated_rules):
     return new_rules, updated_rules
 
 
-def generate_port_forward_rules(interface, services, filter_cb):
+def generate_service_port_forward_rules(service):
     rules = {}
 
-    for service in services.items:
-        if not filter_cb(service):
+    for address in service.status.load_balancer.ingress:
+        parsed_address = ipaddress.ip_address(address.ip)
+
+        if parsed_address.version != 4:
             continue
 
-        for address in service.status.load_balancer.ingress:
-            parsed_address = ipaddress.ip_address(address.ip)
+        for port in service.spec.ports:
+            if port.port in rules:
+                raise ValueError(f'Duplicate port encountered: {port.port}')
 
-            if parsed_address.version != 4:
-                continue
-
-            for port in service.spec.ports:
-                if port.port in rules:
-                    raise ValueError(f'Duplicate port encountered: {port.port}')
-
-                protocol = port.protocol.lower()
-                rules[port.port] = {
-                    'name': f'{service.metadata.name}/{protocol}/{port.port}',
-                    'pfwd_interface': interface,
-                    'fwd': str(parsed_address),
-                    'src': 'any',
-                    'log': False,
-                    'proto': protocol,
-                    'dst_port': port.port,
-                    'fwd_port': port.port,
-                    'enabled': True,
-                }
+            protocol = port.protocol.lower()
+            rules[port.port] = {
+                'name': '{namespace}/{name}/{protocol}/{port}'.format(
+                    namespace=service.metadata.namespace,
+                    name=service.metadata.name,
+                    protocol=protocol,
+                    port=port.port,
+                ),
+                'fwd': str(parsed_address),
+                'src': 'any',
+                'log': False,
+                'proto': protocol,
+                'dst_port': port.port,
+                'fwd_port': port.port,
+                'enabled': True,
+            }
 
     return rules
 
 
-def publish(unifi, generated_rules, no_create, no_update):
+def handle_event(event, label, unifi):
     result = True
+    operation = EventType(event['type'])
+    service = event['object']
 
-    existing_rules = unifi.rules()
+    if not service_filter(service, label):
+        logger.debug(
+            'Ignoring new event %s for service %s',
+            operation,
+            service.metadata.name,
+        )
+        return False
 
-    port_forward_rules ={
-        port_configuration['dst_port']: port_configuration
-        for port_configuration in existing_rules
-    }
-
-    new_rules, updated_rules = merge_rules(
-        existing_rules,
-        generated_rules,
+    logger.info(
+        'Handling new event %s for service %s',
+        operation,
+        service.metadata.name,
     )
 
-    if not no_create:
-        responses = [
-            unifi.create_rule(rule)
+    new_rules, updated_rules = merge_rules(
+        unifi.rules(),
+        generate_service_port_forward_rules(
+            service,
+        ),
+    )
+
+    if operation == EventType.Deleted:
+        result = all([
+            unifi.delete_port_forward_rule(rule)
+            for rule in updated_rules.values()
+        ])
+    else:
+        create_responses = [
+            unifi.create_port_forward_rule(rule)
             for rule in new_rules.values()
         ]
 
-        result = result and all(responses)
-
-    if not no_update:
-        responses = [
-            unifi.update_rule(rule)
+        update_responses = [
+            unifi.update_port_forward_rule(rule)
             for rule in updated_rules.values()
         ]
 
-        result = result and all(responses)
+        result = all(create_responses) and all(update_responses)
 
     return result
 
@@ -200,13 +250,17 @@ def publish(unifi, generated_rules, no_create, no_update):
 def parse_args():
     parser = argparse.ArgumentParser()
 
+    parser.add_argument('--debug', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument(
         '--label',
         default='io.github.craigcabrey/unifi-forward-ports',
     )
-    parser.add_argument('--no-create', action='store_true')
-    parser.add_argument('--no-update', action='store_true')
+    parser.add_argument(
+        '--watch',
+        action='store_true',
+        help='Continue to watch for service events (act as an "operator")',
+    )
 
     kubernetes = parser.add_argument_group()
     kubernetes.add_argument('--local-cluster', action='store_true')
@@ -219,7 +273,12 @@ def parse_args():
     unifi.add_argument('--unifi-sitename', default='default')
     unifi.add_argument('--unifi-insecure', action='store_true')
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.debug or args.dry_run:
+        logger.setLevel(logging.DEBUG)
+
+    return args
 
 
 def main():
@@ -230,36 +289,36 @@ def main():
     else:
         kubernetes.config.load_incluster_config()
 
-    if not args.unifi_insecure:
+    if args.unifi_insecure:
         requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
-    base_url = f'https://{args.unifi_hostname}'
-    network_url = f'{base_url}/proxy/network/api/s/{args.unifi_sitename}'
-    credentials = {'username': args.unifi_username, 'password': args.unifi_password}
-
-    with kubernetes.client.ApiClient() as client:
-        v1 = kubernetes.client.CoreV1Api(client)
-        services = v1.list_service_for_all_namespaces()
-        generated_rules = generate_port_forward_rules(
-            args.unifi_interface,
-            services,
-            functools.partial(service_filter, label=args.label),
-        )
-
+    v1 = kubernetes.client.CoreV1Api()
     unifi = Unifi(
         args.unifi_username,
         args.unifi_password,
         args.unifi_hostname,
         dry_run=args.dry_run,
         site=args.unifi_sitename,
+        wan_interface=args.unifi_interface,
     ).login()
 
-    return publish(
-        unifi,
-        generated_rules,
-        args.no_create,
-        args.no_update,
-    )
+    while True:
+        try:
+            for event in kubernetes.watch.Watch().stream(
+                v1.list_service_for_all_namespaces,
+                _request_timeout=None if args.watch else 5,
+            ):
+                result = handle_event(
+                    event,
+                    args.label,
+                    unifi,
+                )
+        except KeyboardInterrupt:
+            break
+        except urllib3.exceptions.ReadTimeoutError:
+            break
+
+    return True
 
 
 if __name__ == '__main__':
