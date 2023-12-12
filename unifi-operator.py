@@ -27,6 +27,7 @@ logger.setLevel(logging.INFO)
 class EventType(enum.Enum):
     Added = 'ADDED'
     Deleted = 'DELETED'
+    Modified = 'MODIFIED'
 
 
 class Unifi:
