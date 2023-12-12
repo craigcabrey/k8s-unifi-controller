@@ -17,10 +17,14 @@ spec:
       labels:
         app.kubernetes.io/name: unifi-operator
     spec:
+      serviceAccountName: unifi-operator
       containers:
         - name: unifi-operator
           image: ghcr.io/craigcabrey/unifi-operator:latest
           imagePullPolicy: Always
+          args:
+            - --unifi-insecure
+            - --watch
           envFrom:
             - secretRef:
                 name: unifi-operator
