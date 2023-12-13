@@ -10,16 +10,19 @@ import argparse
 import enum
 import functools
 import ipaddress
+import itertools
 import json
 import logging
 import os
+import queue
 import sys
+import threading
 import typing
-import urllib3  # type: ignore
 
 
 import kubernetes  # type: ignore
 import requests
+import urllib3
 
 
 logger = logging.getLogger(__name__)
@@ -30,8 +33,9 @@ logging.basicConfig(
 logger.setLevel(logging.INFO)
 
 
-Rule = typing.Dict[str, typing.Union[str, bool]]
-RuleSet = typing.Dict[str, Rule]
+PartialPortForwardRule = typing.Dict[str, str]
+PortForwardRule = typing.Dict[str, typing.Union[str, bool]]
+PortForwardRuleSet = typing.Dict[str, PortForwardRule]
 
 
 class EventType(enum.Enum):
@@ -56,13 +60,13 @@ class Service:
     @property
     def addresses(
         self,
-    ) -> typing.Generator[
-        typing.Union[ipaddress.IPv4Address, ipaddress.IPv6Address], None, None
+    ) -> typing.Iterable[
+        typing.Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
     ]:
-        addresses = self._service.status.load_balancer.ingress or []
-
-        for address in addresses:
-            yield ipaddress.ip_address(address.ip)
+        return map(
+            lambda a: ipaddress.ip_address(a.ip),
+            self._service.status.load_balancer.ingress or [],
+        )
 
     @property
     def identifier(self) -> str:
@@ -83,7 +87,9 @@ class Service:
     @property
     def ports(
         self,
-    ) -> typing.List[kubernetes.client.models.v1_service_port.V1ServicePort]:
+    ) -> typing.Iterable[
+        kubernetes.client.models.v1_service_port.V1ServicePort
+    ]:
         return self._service.spec.ports
 
     @property
@@ -91,53 +97,31 @@ class Service:
         return ServiceType(self._service.spec.type)
 
     def merge_existing_port_forward_rules(
-        self, existing_rules: RuleSet
-    ) -> typing.Tuple[RuleSet, RuleSet]:
-        new_rules = {}
-        updated_rules = {}
-        generated_rules = self.port_forward_rules()
+        self, rules: PortForwardRuleSet
+    ) -> typing.Iterable[PortForwardRule]:
+        return map(
+            lambda r: dict(rules.pop(r['name'], r), **r),
+            filter(
+                lambda r: r['name'].startswith(self.identifier),
+                self.port_forward_rules(),
+            ),
+        )
 
-        for name, rule in generated_rules.copy().items():
-            if not name.startswith(self.identifier):
-                continue
-
-            new_rule = generated_rules.pop(name)
-
-            if name in existing_rules:
-                existing_rule = existing_rules.pop(name)
-                updated_rules[name] = dict(existing_rule, **rule)
-                continue
-
-            new_rules[name] = new_rule
-
-        return new_rules, updated_rules
-
-    def port_forward_rules(self) -> RuleSet:
-        rules = {}
-
-        for address in self.addresses:
-            if address.version != 4:
-                continue
-
-            for port in self.ports:
-                name = '{identifier}/{protocol}/{port}'.format(
-                    identifier=self.identifier,
-                    protocol=port.protocol,
-                    port=port.port,
-                ).lower()
-
-                rules[name] = {
-                    'name': name,
-                    'fwd': str(address),
-                    'src': 'any',
-                    'log': False,
-                    'proto': port.protocol.lower(),
-                    'dst_port': port.port,
-                    'fwd_port': port.port,
-                    'enabled': True,
-                }
-
-        return rules
+    def port_forward_rules(self) -> typing.Iterable[PartialPortForwardRule]:
+        return map(
+            lambda item: {
+                'name': f'{self.identifier}/{item[0].protocol}/{item[0].port}'.lower(),
+                'fwd': str(item[1]),
+                'src': 'any',
+                'proto': item[0].protocol.lower(),
+                'dst_port': item[0].port,
+                'fwd_port': item[0].port,
+            },
+            filter(
+                lambda item: item[1].version == 4,
+                itertools.product(self.ports, self.addresses),
+            ),
+        )
 
 
 class ServiceEvent:
@@ -184,9 +168,7 @@ class Unifi:
         self._site = site
         self._wan_interface = wan_interface
 
-    def create_port_forward_rule(self, rule: Rule) -> bool:
-        rule['pfwd_interface'] = self._wan_interface
-
+    def create_port_forward_rule(self, rule: PortForwardRule) -> bool:
         if self._dry_run:
             logger.debug(
                 'Would create port forward rule: %s',
@@ -199,7 +181,19 @@ class Unifi:
 
         return response.ok
 
-    def delete_port_forward_rule(self, rule: Rule) -> bool:
+    def create_or_update_port_forward_rule(self, rule: PortForwardRule) -> bool:
+        fn = self.create_port_forward_rule
+
+        if '_id' in rule:
+            fn = self.update_port_forward_rule
+
+        rule = dict(
+            rule, enabled=True, log=False, pfwd_interface=self._wan_interface
+        )
+
+        return fn(rule)
+
+    def delete_port_forward_rule(self, rule: PortForwardRule) -> bool:
         rule_id = rule.pop('_id', None)
 
         if self._dry_run:
@@ -229,7 +223,7 @@ class Unifi:
 
         return self
 
-    def get_port_forward_rules(self) -> RuleSet:
+    def get_port_forward_rules(self) -> PortForwardRuleSet:
         return {
             rule['name']: rule
             for rule in self._query(
@@ -237,7 +231,7 @@ class Unifi:
             ).json()['data']
         }
 
-    def update_port_forward_rule(self, rule: Rule) -> bool:
+    def update_port_forward_rule(self, rule: PortForwardRule) -> bool:
         rule_id = rule.pop('_id')
         rule['pfwd_interface'] = self._wan_interface
 
@@ -272,47 +266,139 @@ class Unifi:
         )
 
 
-def handle_event(event: ServiceEvent, label: str, unifi: Unifi) -> bool:
-    result = True
+class EventManager:
+    def __init__(
+        self,
+        *,
+        core_api: typing.Optional[kubernetes.client.CoreV1Api] = None,
+        event_queue: typing.Optional[queue.Queue] = None,
+        generator_thread: typing.Optional[threading.Thread] = None,
+        handler_thread: typing.Optional[threading.Thread] = None,
+        label: typing.Optional[str] = None,
+        unifi: Unifi,
+        watch: typing.Optional[kubernetes.watch.Watch] = None,
+    ) -> None:
+        if not core_api:
+            core_api = kubernetes.client.CoreV1Api()
 
-    if label not in event.service.labels:
-        logger.debug(
-            'Ignoring event %s for service %s',
+        if not generator_thread:
+            generator_thread = threading.Thread(target=self._generator)
+
+        if not handler_thread:
+            handler_thread = threading.Thread(target=self._handler)
+
+        if not event_queue:
+            event_queue = queue.Queue()
+
+        self.core_api = core_api
+        self.event_queue: queue.Queue = event_queue
+        self.unifi = unifi
+
+        self._event_stream = self._watch_stub
+        self._generator_thread = generator_thread
+        self._handler_thread = handler_thread
+        self._label = label
+        self._running = False
+        self._watch = None
+
+        if watch:
+            self._watch = watch
+            self._event_stream = functools.partial(
+                watch.stream,
+                core_api.list_service_for_all_namespaces,
+            )
+
+    def start(self) -> typing.Self:
+        self.unifi.login()
+        self._running = True
+
+        self._generator_thread.start()
+        self._handler_thread.start()
+
+        return self
+
+    def stop(self) -> None:
+        self._running = False
+
+        if self._watch:
+            self._watch.stop()
+            logger.debug('And now my watch has ended.')
+
+        self.wait()
+
+    def wait(self) -> None:
+        self._generator_thread.join()
+        self._handler_thread.join()
+
+    def _generator(self):
+        while self._running:
+            for event in self._event_stream():
+                self.event_queue.put(ServiceEvent.from_kubernetes_event(event), block=False)
+
+        logger.info('Generator finished!')
+
+    def _handle(self, event: ServiceEvent) -> None:
+        if self._label and self._label not in event.service.labels:
+            logger.debug(
+                'Ignoring event %s for service %s with labels %s',
+                event.type,
+                event.service.name,
+                event.service.labels,
+            )
+            return
+
+        logger.info(
+            'Handling event %s for service %s',
             event.type,
             event.service.name,
         )
-        return True
 
-    logger.info(
-        'Handling event %s for service %s',
-        event.type,
-        event.service.name,
-    )
-
-    new_rules, updated_rules = event.service.merge_existing_port_forward_rules(
-        unifi.get_port_forward_rules(),
-    )
-
-    if event.type == EventType.Deleted:
-        result = all(
-            [
-                unifi.delete_port_forward_rule(rule)
-                for rule in updated_rules.values()
-            ]
+        rules = event.service.merge_existing_port_forward_rules(
+            self.unifi.get_port_forward_rules(),
         )
-    else:
-        create_responses = [
-            unifi.create_port_forward_rule(rule) for rule in new_rules.values()
-        ]
 
-        update_responses = [
-            unifi.update_port_forward_rule(rule)
-            for rule in updated_rules.values()
-        ]
+        fn = self.unifi.create_or_update_port_forward_rule
 
-        result = all(create_responses) and all(update_responses)
+        if event.type == EventType.Deleted:
+            rules = filter(lambda r: '_id' in r, rules)
+            fn = self.unifi.delete_port_forward_rule
 
-    return result
+        logger.info(
+            'Finished handling event %s for service %s with result %s',
+            event.type,
+            event.service.name,
+            all(map(fn, rules)),
+        )
+
+    def _handler(self) -> None:
+        while self._running:
+            event = self.event_queue.get()
+
+            if not event:
+                self.event_queue.task_done()
+                break
+
+            self._handle(event)
+            self.event_queue.task_done()
+
+        try:
+            while not self.event_queue.empty():
+                event = self.event_queue.get(block=False)
+                self._handle(event)
+                self.event_queue.task_done()
+        except queue.Empty:
+            pass
+
+        logger.info('Handler finished!')
+
+    def _watch_stub(self):
+        for service in self.core_api.list_service_for_all_namespaces().items:
+            yield {
+                'object': service,
+                'type': 'ADDED',
+            }
+
+        self._running = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -408,7 +494,6 @@ def main() -> bool:
     if args.unifi_insecure:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    v1 = kubernetes.client.CoreV1Api()
     unifi = Unifi(
         args.unifi_username,
         args.unifi_password,
@@ -416,26 +501,26 @@ def main() -> bool:
         dry_run=args.dry_run,
         site=args.unifi_sitename,
         wan_interface=args.unifi_interface,
-    ).login()
+    )
 
-    while True:
-        try:
-            for event in kubernetes.watch.Watch().stream(
-                v1.list_service_for_all_namespaces,
-                _request_timeout=None if args.watch else 5,
-            ):
-                result = handle_event(
-                    ServiceEvent.from_kubernetes_event(event),
-                    args.label,
-                    unifi,
-                )
-        except KeyboardInterrupt:
-            break
-        except urllib3.exceptions.ReadTimeoutError:
-            if args.watch:
-                raise
-            else:
-                break
+    event_queue: queue.Queue = queue.Queue()
+    manager = EventManager(
+        event_queue=event_queue,
+        label=args.label,
+        unifi=unifi,
+        watch=kubernetes.watch.Watch() if args.watch else None,
+    ).start()
+
+    try:
+        manager.wait()
+    except KeyboardInterrupt:
+        logger.info('Stop requested!')
+        event_queue.put(None)
+        manager.stop()
+    finally:
+        logger.info('Waiting for queue to finalize')
+        event_queue.join()
+        logger.info('Finished')
 
     return True
 

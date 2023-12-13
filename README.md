@@ -16,7 +16,7 @@ There are example manifests under `manifests/` which should be all you need to g
 
 ## Developing
 
-It's strongly recommended to use `virtualenv` or `venv`. Once you have a environment setup, simply install the dependencies: `pip install -r requirements.txt`.
+It's strongly recommended to use `virtualenv` or `venv`. Once you have a environment setup, run `scripts/setup.sh`.
 
 There is a builting dry run mode which makes development much nicer. If you intend on submitting a pull request, please make sure to maintain the integrity of the dry run functionality. Likewise for code styling. There is a helper `prep.sh` for style & type checking.
 
