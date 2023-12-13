@@ -1,6 +1,6 @@
-# unifi-operator
+# k8s-unifi-controller
 
-A simple operator to keep port forwarding rules to up date.
+A simple controller to keep port forwarding rules to up date.
 
 ## Prerequisites
 
@@ -22,9 +22,9 @@ There is a builting dry run mode which makes development much nicer. If you inte
 
 ## Limitations
 
-This operator assumes _full_ control over port forwarding rules. It does not validate for manually added rules. It uses rule names to match against existing rules. Do not edit port forwarding rules manually if you intend to use this system.
+This controller assumes _full_ control over port forwarding rules. It does not validate for manually added rules. It uses rule names to match against existing rules. Do not edit port forwarding rules manually if you intend to use this system.
 
-Likewise, the operator does not currently validate for duplicate port rules. A future version may add this functionality, but for now it is your responsibility to guarantee port uniqueness.
+Likewise, the controller does not currently validate for duplicate port rules. A future version may add this functionality, but for now it is your responsibility to guarantee port uniqueness.
 
 This system uses an unofficial API of the Unifi network application. It may change behavior on any update and break your system. I am not responsible for any breakages.
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 '''
-Kubernetes operator/controller for managing
+Kubernetes controller for managing
 Unifi network devices, namely for forwarding
 ports to LoadBalancer k8s services.
 '''
@@ -332,7 +332,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--watch',
         action='store_true',
-        help='Continue to watch for service events (act as an "operator")',
+        help='Continue to watch for service events (act as an "controller")',
     )
 
     kubernetes = parser.add_argument_group('Kubernetes Configuration')

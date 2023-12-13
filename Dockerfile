@@ -5,4 +5,4 @@ COPY . .
 
 RUN pip install -r requirements.txt --no-cache
 
-ENTRYPOINT ["python3", "unifi-operator.py"]
+ENTRYPOINT ["python3", "controller.py"]

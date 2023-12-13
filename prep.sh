@@ -1,4 +1,4 @@
 #!/bin/sh
 
-mypy unifi-operator.py
+mypy controller.py
 black --skip-string-normalization -l 80 *.py
