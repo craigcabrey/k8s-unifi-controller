@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 
+'''
+Kubernetes operator/controller for managing
+Unifi network devices, namely for forwarding
+ports to LoadBalancer k8s services.
+'''
+
 import argparse
 import enum
 import functools
@@ -8,12 +14,12 @@ import json
 import logging
 import os
 import sys
+import typing
 import urllib3
 
 
-import kubernetes
+import kubernetes  # type: ignore
 import requests
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
 
 logger = logging.getLogger(__name__)
@@ -24,10 +30,127 @@ logging.basicConfig(
 logger.setLevel(logging.INFO)
 
 
+Rule = typing.Dict[str, typing.Union[str, bool]]
+RuleSet = typing.Dict[str, Rule]
+
+
 class EventType(enum.Enum):
     Added = 'ADDED'
     Deleted = 'DELETED'
     Modified = 'MODIFIED'
+
+
+class ServiceType(enum.Enum):
+    ClusterIP = 'ClusterIP'
+    ExternalName = 'ExternalName'
+    LoadBalancer = 'LoadBalancer'
+    NodePort = 'NodePort'
+
+
+class Service:
+    def __init__(
+        self, service: kubernetes.client.models.v1_service.V1Service
+    ) -> None:
+        self._service = service
+
+    @property
+    def addresses(
+        self,
+    ) -> typing.Generator[
+        typing.Union[ipaddress.IPv4Address, ipaddress.IPv6Address], None, None
+    ]:
+        addresses = self._service.status.load_balancer.ingress or []
+
+        for address in addresses:
+            yield ipaddress.ip_address(address.ip)
+
+    @property
+    def identifier(self) -> str:
+        return f'{self.namespace}/{self.name}'
+
+    @property
+    def labels(self) -> typing.Dict[str, str]:
+        return self._service.metadata.labels or {}
+
+    @property
+    def name(self) -> str:
+        return self._service.metadata.name
+
+    @property
+    def namespace(self) -> str:
+        return self._service.metadata.namespace
+
+    @property
+    def ports(
+        self,
+    ) -> typing.List[kubernetes.client.models.v1_service_port.V1ServicePort]:
+        return self._service.spec.ports
+
+    @property
+    def type(self) -> ServiceType:
+        return ServiceType(self._service.spec.type)
+
+    def merge_existing_port_forward_rules(
+        self, existing_rules: RuleSet
+    ) -> typing.Tuple[RuleSet, RuleSet]:
+        new_rules = {}
+        updated_rules = {}
+        generated_rules = self.port_forward_rules()
+
+        for name, rule in generated_rules.copy().items():
+            if not name.startswith(self.identifier):
+                continue
+
+            new_rule = generated_rules.pop(name)
+
+            if name in existing_rules:
+                existing_rule = existing_rules.pop(name)
+                updated_rules[name] = dict(existing_rule, **rule)
+                continue
+
+            new_rules[name] = new_rule
+
+        return new_rules, updated_rules
+
+    def port_forward_rules(self) -> RuleSet:
+        rules = {}
+
+        for address in self.addresses:
+            if address.version != 4:
+                continue
+
+            for port in self.ports:
+                name = '{identifier}/{protocol}/{port}'.format(
+                    identifier=self.identifier,
+                    protocol=port.protocol,
+                    port=port.port,
+                ).lower()
+
+                rules[name] = {
+                    'name': name,
+                    'fwd': str(address),
+                    'src': 'any',
+                    'log': False,
+                    'proto': port.protocol.lower(),
+                    'dst_port': port.port,
+                    'fwd_port': port.port,
+                    'enabled': True,
+                }
+
+        return rules
+
+
+class ServiceEvent:
+    @classmethod
+    def from_kubernetes_event(cls, event) -> typing.Self:
+        return cls(
+            EventType(event['type']),
+            Service(event['object']),
+        )
+
+    def __init__(self, type: EventType, service: Service) -> None:
+        self.type = type
+        self.service = service
 
 
 class Unifi:
@@ -38,14 +161,14 @@ class Unifi:
 
     def __init__(
         self,
-        username,
-        password,
-        hostname,
-        dry_run=False,
-        site=None,
-        wan_interface=None,
-    ):
-        self._csrf = None
+        username: str,
+        password: str,
+        hostname: str,
+        dry_run: bool = False,
+        site: typing.Optional[str] = None,
+        wan_interface: typing.Optional[str] = None,
+    ) -> None:
+        self._csrf: typing.Optional[str] = None
         self._username = username
         self._password = password
         self._session = requests.Session()
@@ -61,7 +184,7 @@ class Unifi:
         self._site = site
         self._wan_interface = wan_interface
 
-    def create_port_forward_rule(self, rule):
+    def create_port_forward_rule(self, rule: Rule) -> bool:
         rule['pfwd_interface'] = self._wan_interface
 
         if self._dry_run:
@@ -72,19 +195,29 @@ class Unifi:
             return True
 
         logger.info('Creating new port forward rule: %s', rule)
-        return self._query(self._session.post, 'rest/portforward', rule)
+        response = self._query(self._session.post, 'rest/portforward', rule)
 
-    def delete_port_forward_rule(self, rule):
-        rule_id = rule.pop('_id')
+        return response.ok
+
+    def delete_port_forward_rule(self, rule: Rule) -> bool:
+        rule_id = rule.pop('_id', None)
 
         if self._dry_run:
             logger.debug('Would delete port forward rule %s', rule_id)
             return True
 
-        logger.info('Delete port forward rule: %s', rule_id)
-        return self._query(self._session.delete, f'rest/portforward/{rule_id}')
+        if not rule_id:
+            logger.warn('Attempted to delete rule with an id: %s', rule)
+            return False
 
-    def login(self):
+        logger.info('Delete port forward rule: %s', rule_id)
+        response = self._query(
+            self._session.delete, f'rest/portforward/{rule_id}'
+        )
+
+        return response.ok
+
+    def login(self) -> typing.Self:
         response = self._session.post(
             f'{self._base_url}/api/auth/login',
             headers=self.REQUEST_HEADERS,
@@ -96,13 +229,15 @@ class Unifi:
 
         return self
 
-    def rules(self):
-        return self._session.get(
-            self._endpoint('rest/portforward'),
-            headers=self.REQUEST_HEADERS,
-        ).json()['data']
+    def get_port_forward_rules(self) -> RuleSet:
+        return {
+            rule['name']: rule
+            for rule in self._query(
+                self._session.get, 'rest/portforward'
+            ).json()['data']
+        }
 
-    def update_port_forward_rule(self, rule):
+    def update_port_forward_rule(self, rule: Rule) -> bool:
         rule_id = rule.pop('_id')
         rule['pfwd_interface'] = self._wan_interface
 
@@ -115,128 +250,59 @@ class Unifi:
             return True
 
         logger.info('Updating port forward rule %s: %s', rule_id, rule)
-        return self._query(self._session.put, f'rest/portforward/{rule_id}', rule)
+        response = self._query(
+            self._session.put, f'rest/portforward/{rule_id}', rule
+        )
 
-    def _endpoint(self, endpoint):
+        return response.ok
+
+    def _endpoint(self, endpoint: str) -> str:
         return f'{self._base_url}/proxy/network/api/s/{self._site}/{endpoint}'
 
-    def _query(self, method, endpoint, payload=None):
+    def _query(
+        self,
+        method: typing.Callable,
+        endpoint: str,
+        payload: typing.Optional[typing.Any] = None,
+    ) -> requests.models.Response:
         return method(
-            self._endpoint('rest/portforward'),
+            self._endpoint(endpoint),
             headers=dict(self.REQUEST_HEADERS, **{'X-CSRF-TOKEN': self._csrf}),
             json=payload,
         )
 
 
-def service_filter(service, label):
-    if service.spec.type != 'LoadBalancer':
-        return False
-
-    labels = service.metadata.labels or {}
-
-    if label not in labels:
-        return False
-
-    return True
-
-
-def merge_rules(existing_rules, generated_rules):
-    port_forward_rules = {
-        port_configuration['dst_port']: port_configuration
-        for port_configuration in existing_rules
-    }
-
-    new_rules = {}
-    updated_rules = {}
-    for port, configuration in generated_rules.copy().items():
-        new_rule = generated_rules.pop(port)
-
-        key = None
-        str_port = str(port)
-
-        if port in port_forward_rules:
-            key = port
-        if str_port in port_forward_rules:
-            key = str_port
-
-        if key:
-            old_rule = port_forward_rules.pop(key)
-            updated_rules[str_port] = dict(old_rule, **configuration)
-            continue
-
-        new_rules[port] = new_rule
-
-    return new_rules, updated_rules
-
-
-def generate_service_port_forward_rules(service):
-    rules = {}
-
-    for address in service.status.load_balancer.ingress:
-        parsed_address = ipaddress.ip_address(address.ip)
-
-        if parsed_address.version != 4:
-            continue
-
-        for port in service.spec.ports:
-            if port.port in rules:
-                raise ValueError(f'Duplicate port encountered: {port.port}')
-
-            protocol = port.protocol.lower()
-            rules[port.port] = {
-                'name': '{namespace}/{name}/{protocol}/{port}'.format(
-                    namespace=service.metadata.namespace,
-                    name=service.metadata.name,
-                    protocol=protocol,
-                    port=port.port,
-                ),
-                'fwd': str(parsed_address),
-                'src': 'any',
-                'log': False,
-                'proto': protocol,
-                'dst_port': port.port,
-                'fwd_port': port.port,
-                'enabled': True,
-            }
-
-    return rules
-
-
-def handle_event(event, label, unifi):
+def handle_event(event: ServiceEvent, label: str, unifi: Unifi) -> bool:
     result = True
-    operation = EventType(event['type'])
-    service = event['object']
 
-    if not service_filter(service, label):
+    if label not in event.service.labels:
         logger.debug(
-            'Ignoring new event %s for service %s',
-            operation,
-            service.metadata.name,
+            'Ignoring event %s for service %s',
+            event.type,
+            event.service.name,
         )
-        return False
+        return True
 
     logger.info(
-        'Handling new event %s for service %s',
-        operation,
-        service.metadata.name,
+        'Handling event %s for service %s',
+        event.type,
+        event.service.name,
     )
 
-    new_rules, updated_rules = merge_rules(
-        unifi.rules(),
-        generate_service_port_forward_rules(
-            service,
-        ),
+    new_rules, updated_rules = event.service.merge_existing_port_forward_rules(
+        unifi.get_port_forward_rules(),
     )
 
-    if operation == EventType.Deleted:
-        result = all([
-            unifi.delete_port_forward_rule(rule)
-            for rule in updated_rules.values()
-        ])
+    if event.type == EventType.Deleted:
+        result = all(
+            [
+                unifi.delete_port_forward_rule(rule)
+                for rule in updated_rules.values()
+            ]
+        )
     else:
         create_responses = [
-            unifi.create_port_forward_rule(rule)
-            for rule in new_rules.values()
+            unifi.create_port_forward_rule(rule) for rule in new_rules.values()
         ]
 
         update_responses = [
@@ -249,14 +315,19 @@ def handle_event(event, label, unifi):
     return result
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(__doc__)
 
     parser.add_argument('--debug', action='store_true')
-    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Do not make any mutable changes (best effort)',
+    )
     parser.add_argument(
         '--label',
         default='io.github.craigcabrey/unifi-forward-ports',
+        help='Label on services to track for port forwards',
     )
     parser.add_argument(
         '--watch',
@@ -264,20 +335,47 @@ def parse_args():
         help='Continue to watch for service events (act as an "operator")',
     )
 
-    kubernetes = parser.add_argument_group()
-    kubernetes.add_argument('--local-cluster', action='store_true')
+    kubernetes = parser.add_argument_group('Kubernetes Configuration')
+    kubernetes.add_argument(
+        '--local-cluster',
+        action='store_true',
+        help='Use the config typically located in ~/.kube for cluster access',
+    )
 
-    unifi = parser.add_argument_group()
-    unifi.add_argument('--unifi-interface', default='wan')
-    unifi.add_argument('--unifi-hostname', default='unifi')
-    unifi.add_argument('--unifi-sitename', default='default')
-    unifi.add_argument('--unifi-insecure', action='store_true')
+    unifi = parser.add_argument_group('Unifi Configuration')
+    unifi.add_argument(
+        '--unifi-interface',
+        default='wan',
+        help='Interface from which to setup port forwards',
+    )
+    unifi.add_argument(
+        '--unifi-hostname',
+        default='unifi',
+        help='Hostname of the Unifi Dream Machine',
+    )
+    unifi.add_argument(
+        '--unifi-sitename',
+        default='default',
+        help='Sitename in the Unifi Network application',
+    )
+    unifi.add_argument(
+        '--unifi-insecure',
+        action='store_true',
+        help=(
+            'Do not validate server certificate (Unifi equipment comes loaded '
+            'with self-signed certificates)'
+        ),
+    )
 
     env_unifi_username = os.environ.get('UNIFI_OPERATOR_UNIFI_USERNAME')
     unifi.add_argument(
         '--unifi-username',
         default=env_unifi_username,
         required=not env_unifi_username,
+        help=(
+            'Username for API access (also settable via '
+            'UNIFI_OPERATOR_UNIFI_USERNAME environment variable)'
+        ),
     )
 
     env_unifi_password = os.environ.get('UNIFI_OPERATOR_UNIFI_PASSWORD')
@@ -285,6 +383,10 @@ def parse_args():
         '--unifi-password',
         default=env_unifi_password,
         required=not env_unifi_password,
+        help=(
+            'Password for API access (also settable via '
+            'UNIFI_OPERATOR_UNIFI_PASSWORD environment variable)'
+        ),
     )
 
     args = parser.parse_args()
@@ -295,7 +397,7 @@ def parse_args():
     return args
 
 
-def main():
+def main() -> bool:
     args = parse_args()
 
     if args.local_cluster:
@@ -304,7 +406,7 @@ def main():
         kubernetes.config.load_incluster_config()
 
     if args.unifi_insecure:
-        requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     v1 = kubernetes.client.CoreV1Api()
     unifi = Unifi(
@@ -323,14 +425,17 @@ def main():
                 _request_timeout=None if args.watch else 5,
             ):
                 result = handle_event(
-                    event,
+                    ServiceEvent.from_kubernetes_event(event),
                     args.label,
                     unifi,
                 )
         except KeyboardInterrupt:
             break
         except urllib3.exceptions.ReadTimeoutError:
-            break
+            if args.watch:
+                raise
+            else:
+                break
 
     return True
 
