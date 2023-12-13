@@ -15,7 +15,7 @@ import logging
 import os
 import sys
 import typing
-import urllib3
+import urllib3  # type: ignore
 
 
 import kubernetes  # type: ignore

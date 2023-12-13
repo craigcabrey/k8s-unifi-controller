@@ -10,6 +10,16 @@ A simple operator to keep port forwarding rules to up date.
 * IPv4 only (for now)
   * A future version will add opt-in support for IPv6 firewall management (if possible)
 
+## Deploying
+
+There are example manifests under `manifests/` which should be all you need to get started. The container image is available at `ghcr.io/craigcabrey/unifi-controller`.
+
+## Developing
+
+It's strongly recommended to use `virtualenv` or `venv`. Once you have a environment setup, simply install the dependencies: `pip install -r requirements.txt`.
+
+There is a builting dry run mode which makes development much nicer. If you intend on submitting a pull request, please make sure to maintain the integrity of the dry run functionality. Likewise for code styling. There is a helper `prep.sh` for style & type checking.
+
 ## Limitations
 
 This operator assumes _full_ control over port forwarding rules. It does not validate for manually added rules. It uses rule names to match against existing rules. Do not edit port forwarding rules manually if you intend to use this system.
