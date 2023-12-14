@@ -96,16 +96,22 @@ class Service:
     def type(self) -> ServiceType:
         return ServiceType(self._service.spec.type)
 
-    def merge_existing_port_forward_rules(
+    def update_port_forward_rules(
         self, rules: PortForwardRuleSet
-    ) -> typing.Iterable[PortForwardRule]:
-        return map(
-            lambda r: dict(rules.pop(r['name'], r), **r),
-            filter(
-                lambda r: r['name'].startswith(self.identifier),
-                self.port_forward_rules(),
-            ),
+    ) -> typing.Tuple[
+        typing.Iterable[PortForwardRule], typing.Iterable[PortForwardRule]
+    ]:
+        existing_service_rules = {
+            name: rule
+            for name, rule in rules.items()
+            if name.startswith(self.identifier)
+        }
+        updated_rules = map(
+            lambda r: dict(existing_service_rules.pop(r['name'], r), **r),
+            self.port_forward_rules(),
         )
+
+        return updated_rules, existing_service_rules.values()
 
     def port_forward_rules(self) -> typing.Iterable[PartialPortForwardRule]:
         return map(
@@ -317,7 +323,7 @@ class EventManager:
 
         return self
 
-    def stop(self) -> None:
+    def stop(self, *_) -> None:
         self._running = False
 
         if self._watch:
@@ -333,7 +339,9 @@ class EventManager:
     def _generator(self):
         while self._running:
             for event in self._event_stream():
-                self.event_queue.put(ServiceEvent.from_kubernetes_event(event), block=False)
+                self.event_queue.put(
+                    ServiceEvent.from_kubernetes_event(event), block=False
+                )
 
         logger.info('Generator finished!')
 
@@ -353,21 +361,27 @@ class EventManager:
             event.service.name,
         )
 
-        rules = event.service.merge_existing_port_forward_rules(
+        updated_rules, removed_rules = event.service.update_port_forward_rules(
             self.unifi.get_port_forward_rules(),
         )
 
-        fn = self.unifi.create_or_update_port_forward_rule
-
         if event.type == EventType.Deleted:
-            rules = filter(lambda r: '_id' in r, rules)
-            fn = self.unifi.delete_port_forward_rule
+            removed_rules = filter(
+                lambda r: '_id' in r,
+                itertools.chain(updated_rules, removed_rules),
+            )
+            updated_rules = []
+
+        updated = all(
+            map(self.unifi.create_or_update_port_forward_rule, updated_rules)
+        )
+        deleted = all(map(self.unifi.delete_port_forward_rule, removed_rules))
 
         logger.info(
             'Finished handling event %s for service %s with result %s',
             event.type,
             event.service.name,
-            all(map(fn, rules)),
+            updated and deleted,
         )
 
     def _handler(self) -> None:
