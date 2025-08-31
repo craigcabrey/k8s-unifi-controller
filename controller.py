@@ -144,26 +144,27 @@ class ServiceEvent:
 
 
 class Unifi:
-    REQUEST_HEADERS = {
+    DEFAULT_REQUEST_HEADERS = {
         'Accept': 'application/json',
         'Content-Type': 'application/json',
     }
 
     def __init__(
         self,
-        username: str,
-        password: str,
+        token: str,
         hostname: str,
         dry_run: bool = False,
         site: typing.Optional[str] = None,
+        verify: bool = True,
         wan_interface: typing.Optional[str] = None,
     ) -> None:
-        self._csrf: typing.Optional[str] = None
-        self._username = username
-        self._password = password
         self._session = requests.Session()
         self._base_url = f'https://{hostname}'
         self._dry_run = dry_run
+        self._request_headers = dict(
+            self.DEFAULT_REQUEST_HEADERS,
+            **{"X-API-KEY": token},
+        )
 
         if not site:
             site = 'default'
@@ -172,6 +173,7 @@ class Unifi:
             wan_interface = 'wan'
 
         self._site = site
+        self._verify = verify
         self._wan_interface = wan_interface
 
     def create_port_forward_rule(self, rule: PortForwardRule) -> bool:
@@ -217,18 +219,6 @@ class Unifi:
 
         return response.ok
 
-    def login(self) -> typing.Self:
-        response = self._session.post(
-            f'{self._base_url}/api/auth/login',
-            headers=self.REQUEST_HEADERS,
-            json={'username': self._username, 'password': self._password},
-            verify=False,
-        )
-
-        self._csrf = response.headers['X-CSRF-Token']
-
-        return self
-
     def get_port_forward_rules(self) -> PortForwardRuleSet:
         return {
             rule['name']: rule
@@ -265,11 +255,17 @@ class Unifi:
         endpoint: str,
         payload: typing.Optional[typing.Any] = None,
     ) -> requests.models.Response:
-        return method(
+        response = method(
             self._endpoint(endpoint),
-            headers=dict(self.REQUEST_HEADERS, **{'X-CSRF-TOKEN': self._csrf}),
+            headers=self._request_headers,
             json=payload,
+            verify=self._verify,
         )
+
+        if self._dry_run:
+            logger.debug(response.json())
+
+        return response
 
 
 class EventManager:
@@ -315,7 +311,6 @@ class EventManager:
             )
 
     def start(self) -> typing.Self:
-        self.unifi.login()
         self._running = True
 
         self._generator_thread.start()
@@ -467,25 +462,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
-    env_unifi_username = os.environ.get('UNIFI_OPERATOR_UNIFI_USERNAME')
+    env_unifi_token = os.environ.get('UNIFI_OPERATOR_UNIFI_TOKEN')
     unifi.add_argument(
-        '--unifi-username',
-        default=env_unifi_username,
-        required=not env_unifi_username,
+        '--unifi-token',
+        default=env_unifi_token,
+        required=not env_unifi_token,
         help=(
-            'Username for API access (also settable via '
-            'UNIFI_OPERATOR_UNIFI_USERNAME environment variable)'
-        ),
-    )
-
-    env_unifi_password = os.environ.get('UNIFI_OPERATOR_UNIFI_PASSWORD')
-    unifi.add_argument(
-        '--unifi-password',
-        default=env_unifi_password,
-        required=not env_unifi_password,
-        help=(
-            'Password for API access (also settable via '
-            'UNIFI_OPERATOR_UNIFI_PASSWORD environment variable)'
+            'Token for API access (also settable via '
+            'UNIFI_OPERATOR_UNIFI_TOKEN environment variable)'
         ),
     )
 
@@ -509,11 +493,11 @@ def main() -> bool:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     unifi = Unifi(
-        args.unifi_username,
-        args.unifi_password,
+        args.unifi_token,
         args.unifi_hostname,
         dry_run=args.dry_run,
         site=args.unifi_sitename,
+        verify=not args.unifi_insecure,
         wan_interface=args.unifi_interface,
     )
 
