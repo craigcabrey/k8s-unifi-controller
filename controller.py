@@ -163,7 +163,7 @@ class Unifi:
         self._dry_run = dry_run
         self._request_headers = dict(
             self.DEFAULT_REQUEST_HEADERS,
-            **{"X-API-KEY": token},
+            **{'X-API-KEY': token},
         )
 
         if not site:
@@ -278,7 +278,7 @@ class EventManager:
         handler_thread: typing.Optional[threading.Thread] = None,
         label: typing.Optional[str] = None,
         unifi: Unifi,
-        watch: typing.Optional[kubernetes.watch.Watch] = None,
+        watch: bool = False,
     ) -> None:
         if not core_api:
             core_api = kubernetes.client.CoreV1Api()
@@ -304,11 +304,7 @@ class EventManager:
         self._watch = None
 
         if watch:
-            self._watch = watch
-            self._event_stream = functools.partial(
-                watch.stream,
-                core_api.list_service_for_all_namespaces,
-            )
+            self._init_watch()
 
     def start(self) -> typing.Self:
         self._running = True
@@ -333,10 +329,16 @@ class EventManager:
 
     def _generator(self):
         while self._running:
-            for event in self._event_stream():
-                self.event_queue.put(
-                    ServiceEvent.from_kubernetes_event(event), block=False
-                )
+            try:
+                logger.info('Starting event loop')
+
+                for event in self._event_stream():
+                    self.event_queue.put(
+                        ServiceEvent.from_kubernetes_event(event), block=False
+                    )
+            except kubernetes.client.rest.ApiException:
+                logger.info('Kubernetes watch expired, re-creating')
+                self._init_watch()
 
         logger.info('Generator finished!')
 
@@ -399,6 +401,13 @@ class EventManager:
             pass
 
         logger.info('Handler finished!')
+
+    def _init_watch(self) -> None:
+        self._watch = kubernetes.watch.Watch()
+        self._event_stream = functools.partial(
+            self._watch.stream,
+            self.core_api.list_service_for_all_namespaces,
+        )
 
     def _watch_stub(self):
         for service in self.core_api.list_service_for_all_namespaces().items:
@@ -506,7 +515,7 @@ def main() -> bool:
         event_queue=event_queue,
         label=args.label,
         unifi=unifi,
-        watch=kubernetes.watch.Watch() if args.watch else None,
+        watch=args.watch,
     ).start()
 
     try:
