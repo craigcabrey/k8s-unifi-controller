@@ -64,8 +64,17 @@ class Service:
         typing.Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
     ]:
         return map(
-            lambda a: ipaddress.ip_address(a.ip),
-            self._service.status.load_balancer.ingress or [],
+            lambda a: ipaddress.ip_address(a),
+            filter(
+                None,
+                itertools.chain(
+                    map(
+                        lambda a: a.ip,
+                        self._service.status.load_balancer.ingress or [],
+                    ),
+                    [self._service.spec.external_name],
+                )
+            )
         )
 
     @property
@@ -327,7 +336,7 @@ class EventManager:
         self._generator_thread.join()
         self._handler_thread.join()
 
-    def _generator(self):
+    def _generator(self) -> None:
         while self._running:
             try:
                 logger.info('Starting event loop')
@@ -409,7 +418,7 @@ class EventManager:
             self.core_api.list_service_for_all_namespaces,
         )
 
-    def _watch_stub(self):
+    def _watch_stub(self) -> None:
         for service in self.core_api.list_service_for_all_namespaces().items:
             yield {
                 'object': service,
