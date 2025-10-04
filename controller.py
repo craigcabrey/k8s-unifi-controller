@@ -288,6 +288,7 @@ class EventManager:
         label: typing.Optional[str] = None,
         unifi: Unifi,
         watch: bool = False,
+        watch_timeout: int = 30,
     ) -> None:
         if not core_api:
             core_api = kubernetes.client.CoreV1Api()
@@ -311,6 +312,10 @@ class EventManager:
         self._label = label
         self._running = False
         self._watch = None
+        self._watch_timeout = watch_timeout
+
+        self._handler_error = False
+        self._generator_error = False
 
         if watch:
             self._init_watch()
@@ -327,29 +332,39 @@ class EventManager:
         self._running = False
 
         if self._watch:
+            logger.info(f'Stopping in-progress watch, this may take up to {self._watch_timeout} seconds')
             self._watch.stop()
             logger.debug('And now my watch has ended.')
 
         self.wait()
 
-    def wait(self) -> None:
+    def wait(self) -> bool:
         self._generator_thread.join()
         self._handler_thread.join()
 
+        return not self._handler_error and not self._generator_error
+
     def _generator(self) -> None:
-        while self._running:
-            try:
-                logger.info('Starting event loop')
+        logger.info('Starting generator loop')
 
-                for event in self._event_stream():
-                    self.event_queue.put(
-                        ServiceEvent.from_kubernetes_event(event), block=False
-                    )
-            except kubernetes.client.rest.ApiException:
-                logger.info('Kubernetes watch expired, re-creating')
+        try:
+            while self._running:
                 self._init_watch()
+                try:
+                    logger.debug('Starting new event stream loop')
 
-        logger.info('Generator finished!')
+                    for event in self._event_stream():
+                        self.event_queue.put(
+                            ServiceEvent.from_kubernetes_event(event), block=False
+                        )
+                except kubernetes.client.rest.ApiException:
+                    logger.info('Kubernetes watch expired, restarting')
+        except Exception as e:
+            log.exception('Failure in generator thread, aborting')
+            self._generator_error = True
+            self._running = False
+        else:
+            logger.info('Generator finished!')
 
     def _handle(self, event: ServiceEvent) -> None:
         if self._label and self._label not in event.service.labels:
@@ -383,7 +398,8 @@ class EventManager:
         )
         deleted = all(map(self.unifi.delete_port_forward_rule, removed_rules))
 
-        logger.info(
+        fn = logger.info if updated and deleted else logger.error
+        fn(
             'Finished handling event %s for service %s with result %s',
             event.type,
             event.service.name,
@@ -391,31 +407,37 @@ class EventManager:
         )
 
     def _handler(self) -> None:
-        while self._running:
-            event = self.event_queue.get()
-
-            if not event:
-                self.event_queue.task_done()
-                break
-
-            self._handle(event)
-            self.event_queue.task_done()
-
         try:
-            while not self.event_queue.empty():
-                event = self.event_queue.get(block=False)
+            while self._running:
+                event = self.event_queue.get()
+
+                if not event:
+                    self.event_queue.task_done()
+                    break
+
                 self._handle(event)
                 self.event_queue.task_done()
-        except queue.Empty:
-            pass
 
-        logger.info('Handler finished!')
+            try:
+                while not self.event_queue.empty():
+                    event = self.event_queue.get(block=False)
+                    self._handle(event)
+                    self.event_queue.task_done()
+            except queue.Empty:
+                pass
+        except Exception as e:
+            log.exception('Failure in handler thread, aborting')
+            self._handler_error = True
+            self._running = False
+        else:
+            logger.info('Handler finished!')
 
     def _init_watch(self) -> None:
         self._watch = kubernetes.watch.Watch()
         self._event_stream = functools.partial(
             self._watch.stream,
             self.core_api.list_service_for_all_namespaces,
+            timeout_seconds=self._watch_timeout,
         )
 
     def _watch_stub(self) -> None:
@@ -446,6 +468,12 @@ def parse_args() -> argparse.Namespace:
         '--watch',
         action='store_true',
         help='Continue to watch for service events (act as an "controller")',
+    )
+    parser.add_argument(
+        '--watch-timeout',
+        type=int,
+        default=30,
+        help='Time to wait for events while watching Kubernetes event stream',
     )
 
     kubernetes = parser.add_argument_group('Kubernetes Configuration')
@@ -525,10 +553,12 @@ def main() -> bool:
         label=args.label,
         unifi=unifi,
         watch=args.watch,
+        watch_timeout=args.watch_timeout,
     ).start()
 
+    result = True
     try:
-        manager.wait()
+        result = manager.wait()
     except KeyboardInterrupt:
         logger.info('Stop requested!')
         event_queue.put(None)
@@ -538,7 +568,7 @@ def main() -> bool:
         event_queue.join()
         logger.info('Finished')
 
-    return True
+    return result
 
 
 if __name__ == '__main__':
