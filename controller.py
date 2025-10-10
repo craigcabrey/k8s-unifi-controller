@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import queue
+import socket
 import sys
 import threading
 import typing
@@ -72,7 +73,13 @@ class Service:
                         lambda a: a.ip,
                         self._service.status.load_balancer.ingress or [],
                     ),
-                    [self._service.spec.external_name],
+                    map(
+                        lambda a: socket.gethostbyname(a),
+                        filter(
+                            None,
+                            [self._service.spec.external_name],
+                        )
+                    ),
                 )
             )
         )
