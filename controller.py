@@ -434,10 +434,21 @@ class EventManager:
                 pass
         except Exception as e:
             logger.exception('Failure in handler thread, aborting')
+            self.event_queue.task_done()
             self._handler_error = True
             self._running = False
-        else:
-            logger.info('Handler finished!')
+            # Wait for generator to stop before final cleanup
+            self._generator_thread.join()
+        finally:
+            try:
+                while not self.event_queue.empty():
+                    self.event_queue.get(block=False)
+                    self.event_queue.task_done()
+            except queue.Empty:
+                pass
+
+            if not self._handler_error:
+                 logger.info('Handler finished!')
 
     def _init_watch(self) -> None:
         self._watch = kubernetes.watch.Watch()
