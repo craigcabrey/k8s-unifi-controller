@@ -145,6 +145,26 @@ class Service:
             ),
         )
 
+    def firewall_group_v6(self) -> typing.Optional[typing.Dict]:
+        group_members = list(
+            map(
+                lambda address: str(address),
+                filter(
+                    lambda address: address.version == 6,
+                    self.addresses,
+                ),
+            ),
+        )
+
+        if not group_members:
+            return False
+
+        return {
+            'name': self.identifier.lower(),
+            'group_type': 'ipv6-address-group',
+            'group_members': group_members,
+        }
+
 
 class ServiceEvent:
     @classmethod
@@ -258,6 +278,29 @@ class Unifi:
         logger.info('Updating port forward rule %s: %s', rule_id, rule)
         response = self._query(
             self._session.put, f'rest/portforward/{rule_id}', rule
+        )
+
+        return response.ok
+
+    def update_firewall_group(self, firewall_group_id, firewall_group) -> bool:
+        if self._dry_run:
+            logger.debug(
+                'Would update firewall group %s: %s',
+                firewall_group_id,
+                json.dumps(firewall_group, indent=2),
+            )
+            return True
+
+        logger.info(
+            'Updating firewall group %s: %s',
+            firewall_group_id,
+            firewall_group,
+        )
+
+        response = self._query(
+            self._session.put,
+            f'rest/firewallgroup/{firewall_group_id}',
+            firewall_group,
         )
 
         return response.ok
@@ -404,6 +447,16 @@ class EventManager:
             map(self.unifi.create_or_update_port_forward_rule, updated_rules)
         )
         deleted = all(map(self.unifi.delete_port_forward_rule, removed_rules))
+
+        if event.service.labels[self._label] != 'true':
+            logger.debug('Label value might be a firewall group id, trying')
+
+            firewall_group = event.service.firewall_group_v6()
+            if firewall_group:
+                updated = updated and self.unifi.update_firewall_group(
+                    event.service.labels[self._label],
+                    firewall_group,
+                )
 
         fn = logger.info if updated and deleted else logger.error
         fn(

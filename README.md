@@ -1,18 +1,33 @@
 # k8s-unifi-controller
 
-A simple controller to keep port forwarding rules to up date.
+A simple controller to keep firewall rules to up date.
 
 ## Prerequisites
 
 * Unifi Dream Machine (and likely SE)
   * Support could be added for the standalone network controller if needed
 * Functioning network (e.g. this will not magically fix network issues if manual port forwards aren't working)
-* IPv4 only (for now)
-  * A future version will add opt-in support for IPv6 firewall management (if possible)
 
 ## Deploying
 
 There are example manifests under `manifests/` which should be all you need to get started. The container image is available at `ghcr.io/craigcabrey/unifi-controller`.
+
+## Using
+
+Once deployed, the controller will watch for services labeled with `io.github.craigcabrey/unifi-forward-ports` (which can be overridden via the `--label` flag). The value of the label should be `true` OR the ID of a firewall group used for tracking IPv6 addresses. For example:
+
+```
+$ k get svc ingress-controller -o yaml
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+<snip>
+    io.github.craigcabrey/unifi-forward-ports: 64ec19326868ee84586bb608
+<snip>
+```
+
+If set to a firewall group ID, the controller will sync the contents of the firewall group with the IPv6 addresses of the service. Then, you can add a firewall group that references the firewall group in the Unifi controller. If the IPv6 address of the service changes (which *can* happen), the firewall will be seamlessly updated.
 
 ## Developing
 
