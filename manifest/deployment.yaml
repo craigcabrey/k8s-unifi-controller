@@ -23,6 +23,7 @@ spec:
           image: ghcr.io/craigcabrey/k8s-unifi-controller:latest
           imagePullPolicy: Always
           args:
+            - ./k8s-unifi-controller
             - --unifi-insecure
             - --watch
           envFrom:

@@ -14,7 +14,7 @@ There are example manifests under `manifests/` which should be all you need to g
 
 ## Using
 
-Once deployed, the controller will watch for services labeled with `io.github.craigcabrey/unifi-forward-ports` (which can be overridden via the `--label` flag). The value of the label should be `true` OR the ID of a firewall group used for tracking IPv6 addresses. For example:
+Once deployed, the controller will watch for services labeled with either `io.github.craigcabrey/unifi-forward-ports` (which can be overridden via the `--label` flag) or `io.github.craigcabrey/unifi-firewall-group` (`--firewall-group-label`). The former will publish port forward rules for IPv4 services, while the latter will publish firewall groups for IPv6 services.
 
 ```
 $ k get svc ingress-controller -o yaml
@@ -23,21 +23,22 @@ kind: Service
 metadata:
   labels:
 <snip>
-    io.github.craigcabrey/unifi-forward-ports: 64ec19326868ee84586bb608
+    io.github.craigcabrey/unifi-forward-ports: true
+    io.github.craigcabrey/unifi-firewall-group: true
 <snip>
 ```
 
-If set to a firewall group ID, the controller will sync the contents of the firewall group with the IPv6 addresses of the service. Then, you can add a firewall group that references the firewall group in the Unifi controller. If the IPv6 address of the service changes (which *can* happen), the firewall will be seamlessly updated.
+Rules will be created with deterministic names. Then, you can add a firewall group that references the firewall group in the Unifi controller. If the IPv6 address of the service changes (which *can* happen), the firewall will be seamlessly updated.
+
+**Note! This controller is ended to control ALL port forwards & firewall groups. It WILL delete other rules!**
 
 ## Developing
 
-It's strongly recommended to use `virtualenv` or `venv`. Once you have a environment setup, run `scripts/setup.sh`.
-
-There is a builting dry run mode which makes development much nicer. If you intend on submitting a pull request, please make sure to maintain the integrity of the dry run functionality. Likewise for code styling. There is a helper `prep.sh` for style & type checking.
+There is a builting dry run mode which makes development much nicer. If you intend on submitting a pull request, please make sure to maintain the integrity of the dry run functionality. Likewise for code styling.
 
 ## Limitations
 
-This controller assumes _full_ control over port forwarding rules. It does not validate for manually added rules. It uses rule names to match against existing rules. Do not edit port forwarding rules manually if you intend to use this system.
+This controller assumes _full_ control over rules. It does not validate for manually added rules. It uses rule names to match against existing rules. Do not edit port forwarding rules manually if you intend to use this system.
 
 Likewise, the controller does not currently validate for duplicate port rules. A future version may add this functionality, but for now it is your responsibility to guarantee port uniqueness.
 
