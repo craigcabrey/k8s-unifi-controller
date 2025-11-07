@@ -14,6 +14,10 @@ spec:
       app.kubernetes.io/name: k8s-unifi-controller
   template:
     metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9898"
+        prometheus.io/path: "/metrics"
       labels:
         app.kubernetes.io/name: k8s-unifi-controller
     spec:
@@ -26,6 +30,7 @@ spec:
             - ./k8s-unifi-controller
             - --unifi-insecure
             - --watch
+            - --metrics
           envFrom:
             - secretRef:
                 name: k8s-unifi-controller

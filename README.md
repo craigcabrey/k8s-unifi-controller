@@ -16,6 +16,27 @@ There are example manifests under `manifests/` which should be all you need to g
 
 Once deployed, the controller will watch for services labeled with either `io.github.craigcabrey/unifi-forward-ports` (which can be overridden via the `--label` flag) or `io.github.craigcabrey/unifi-firewall-group` (`--firewall-group-label`). The former will publish port forward rules for IPv4 services, while the latter will publish firewall groups for IPv6 services.
 
+### Metrics
+
+The controller exposes Prometheus metrics on port 9898. The following metrics are available:
+
+* `services_seen_total`: Total number of services seen by the controller
+* `services_processed_total`: Total number of services processed by the controller (having relevant labels)
+* `port_forward_updates_total`: Total number of port forward updates attempted
+* `port_forward_update_failures_total`: Total number of failed port forward updates
+* `port_forward_creations_total`: Total number of port forward creations attempted
+* `port_forward_creation_failures_total`: Total number of failed port forward creations
+* `port_forward_deletions_total`: Total number of port forward deletions attempted
+* `port_forward_deletion_failures_total`: Total number of failed port forward deletions
+* `firewall_group_updates_total`: Total number of firewall group updates attempted
+* `firewall_group_update_failures_total`: Total number of failed firewall group updates
+* `firewall_group_creations_total`: Total number of firewall group creations attempted
+* `firewall_group_creation_failures_total`: Total number of failed firewall group creations
+* `firewall_group_deletions_total`: Total number of firewall group deletions attempted
+* `firewall_group_deletion_failures_total`: Total number of failed firewall group deletions
+* `reconciliations_total`: Total number of reconciliations
+* `reconciliation_failures_total`: Total number of failed reconciliations
+
 ```
 $ k get svc ingress-controller -o yaml
 apiVersion: v1

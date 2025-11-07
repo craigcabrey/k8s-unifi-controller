@@ -13,8 +13,10 @@ use std::net::IpAddr;
 
 use tokio::signal::unix::{SignalKind, signal};
 
+mod metrics;
 mod models;
 mod unifi;
+use crate::metrics::*;
 use crate::models::Service;
 
 /// A Kubernetes controller to manage Unifi port forwards
@@ -23,6 +25,17 @@ use crate::models::Service;
 struct Cli {
     #[arg(long)]
     debug: bool,
+
+    #[arg(long)]
+    metrics: bool,
+
+    /// Host on which to expose metrics
+    #[arg(long, default_value = "::")]
+    metrics_host: String,
+
+    /// Port on which to expose metrics
+    #[arg(long, default_value = "9898")]
+    metrics_port: u16,
 
     /// Do not make any mutable changes (best effort)
     #[arg(long)]
@@ -69,14 +82,12 @@ struct Cli {
     unifi_token: String,
 }
 
-/// Resolves an external hostname to a list of IP addresses.
-
 async fn process_firewall_group(
     service: &Service,
     label: &str,
     unifi_client: &unifi::UnifiClient,
 ) -> Result<()> {
-    debug!("Checking service for firewall group: {:?}", service);
+    SERVICES_SEEN_TOTAL.inc();
 
     match service.labels() {
         Some(labels) => {
@@ -93,6 +104,7 @@ async fn process_firewall_group(
             return Ok(());
         }
     }
+    SERVICES_PROCESSED_TOTAL.inc();
 
     info!("Processing service for firewall group: {:?}", service);
 
@@ -121,14 +133,18 @@ async fn process_firewall_group(
                     existing_group.group_type = desired_group.group_type.clone();
                     existing_group.group_members = desired_group.group_members.clone();
 
+                    FIREWALL_GROUP_UPDATES_TOTAL.inc();
                     match existing_group.update(unifi_client).await {
                         Ok(g) => {
                             info!("Successfully updated firewall group: {}", g.name);
                         }
-                        Err(e) => error!(
-                            "Failed to update firewall group '{}': {}",
-                            existing_group.name, e
-                        ),
+                        Err(e) => {
+                            FIREWALL_GROUP_UPDATE_FAILURES_TOTAL.inc();
+                            error!(
+                                "Failed to update firewall group '{}': {}",
+                                existing_group.name, e
+                            )
+                        }
                     }
                 } else {
                     info!(
@@ -142,15 +158,19 @@ async fn process_firewall_group(
                     "Firewall group '{}' not found, creating.",
                     desired_group.name
                 );
+                FIREWALL_GROUP_CREATIONS_TOTAL.inc();
                 match desired_group.create(unifi_client).await {
                     Ok(g) => {
                         info!("Successfully created firewall group: {}", g.name);
                         unifi_firewall_groups.push(g);
                     }
-                    Err(e) => error!(
-                        "Failed to create firewall group '{}': {}",
-                        desired_group.name, e
-                    ),
+                    Err(e) => {
+                        FIREWALL_GROUP_CREATION_FAILURES_TOTAL.inc();
+                        error!(
+                            "Failed to create firewall group '{}': {}",
+                            desired_group.name, e
+                        )
+                    }
                 }
             }
         }
@@ -165,6 +185,7 @@ async fn process_port_forwards(
     unifi_client: &unifi::UnifiClient,
     unifi_interface: &str,
 ) -> Result<()> {
+    SERVICES_SEEN_TOTAL.inc();
     debug!("Checking service for port forwards: {:?}", service);
 
     match service.labels() {
@@ -179,6 +200,7 @@ async fn process_port_forwards(
             return Ok(());
         }
     }
+    SERVICES_PROCESSED_TOTAL.inc();
 
     let desired_rules = service.port_forward_rules(unifi_interface).await?;
     let unifi_port_forward_rules = unifi::PortForwardRule::list(unifi_client).await?;
@@ -221,11 +243,13 @@ async fn process_port_forwards(
                     rule.fwd = desired_rule.fwd.clone();
                     rule.fwd_port = desired_rule.fwd_port.clone();
 
+                    PORT_FORWARD_UPDATES_TOTAL.inc();
                     match rule.update(unifi_client).await {
                         Ok(r) => {
                             info!("Successfully updated port forward rule: {}", r.name);
                         }
                         Err(e) => {
+                            PORT_FORWARD_UPDATE_FAILURES_TOTAL.inc();
                             error!("Failed to update port forward rule '{}': {}", rule.name, e)
                         }
                     }
@@ -238,14 +262,18 @@ async fn process_port_forwards(
                     "Port forward rule '{}' not found, creating.",
                     desired_rule.name
                 );
+                PORT_FORWARD_CREATIONS_TOTAL.inc();
                 match desired_rule.create(unifi_client).await {
                     Ok(r) => {
                         info!("Successfully created port forward rule: {}", r.name);
                     }
-                    Err(e) => error!(
-                        "Failed to create port forward rule '{}': {}",
-                        desired_rule.name, e
-                    ),
+                    Err(e) => {
+                        PORT_FORWARD_CREATION_FAILURES_TOTAL.inc();
+                        error!(
+                            "Failed to create port forward rule '{}': {}",
+                            desired_rule.name, e
+                        )
+                    }
                 }
             }
         }
@@ -286,9 +314,13 @@ async fn cleanup_unmatched_resources(
     for rule in &port_forward_rules {
         if !desired_rules.contains(&rule.name) {
             info!("Deleting unmatched port forward rule: '{}'", rule.name);
+            PORT_FORWARD_DELETIONS_TOTAL.inc();
             match rule.delete(unifi_client).await {
                 Ok(_) => info!("Successfully deleted port forward rule: {}", rule.name),
-                Err(e) => error!("Failed to delete port forward rule '{}': {}", rule.name, e),
+                Err(e) => {
+                    PORT_FORWARD_DELETION_FAILURES_TOTAL.inc();
+                    error!("Failed to delete port forward rule '{}': {}", rule.name, e)
+                }
             }
         }
     }
@@ -297,9 +329,13 @@ async fn cleanup_unmatched_resources(
     for group in &firewall_groups {
         if !desired_groups.contains(&group.name) {
             info!("Deleting unmatched firewall group: '{}'", group.name);
+            FIREWALL_GROUP_DELETIONS_TOTAL.inc();
             match group.delete(unifi_client).await {
                 Ok(_) => info!("Successfully deleted firewall group: {}", group.name),
-                Err(e) => error!("Failed to delete firewall group '{}': {}", group.name, e),
+                Err(e) => {
+                    FIREWALL_GROUP_DELETION_FAILURES_TOTAL.inc();
+                    error!("Failed to delete firewall group '{}': {}", group.name, e)
+                }
             }
         }
     }
@@ -319,6 +355,10 @@ async fn main() -> Result<()> {
     }
 
     builder.init();
+
+    if cli.metrics && cli.watch {
+        tokio::spawn(metrics_server(cli.metrics_host.clone(), cli.metrics_port));
+    }
 
     let config = if cli.local_cluster {
         info!("Using local cluster config");
@@ -350,16 +390,19 @@ async fn main() -> Result<()> {
         .collect();
 
     info!("Processing all services once");
+    RECONCILIATIONS_TOTAL.inc();
     for service in &services {
         if let Err(e) =
-            process_port_forwards(&service, &cli.label, &unifi_client, &cli.unifi_interface).await
+            process_port_forwards(service, &cli.label, &unifi_client, &cli.unifi_interface).await
         {
+            RECONCILIATION_FAILURES_TOTAL.inc();
             error!("Error occurred while processing port forwards: {:?}", e)
         };
 
         if let Err(e) =
-            process_firewall_group(&service, &cli.firewall_group_label, &unifi_client).await
+            process_firewall_group(service, &cli.firewall_group_label, &unifi_client).await
         {
+            RECONCILIATION_FAILURES_TOTAL.inc();
             error!("Error occurred while processing firewall group: {:?}", e)
         };
     }
@@ -378,11 +421,14 @@ async fn main() -> Result<()> {
                         Ok(Some(event)) => {
                             match event {
                                 watcher::Event::Apply(s) => {
+                                    RECONCILIATIONS_TOTAL.inc();
                                     let service = Service(s);
                                     if let Err(e) = process_port_forwards(&service, &cli.label, &unifi_client, &cli.unifi_interface).await {
+                                        RECONCILIATION_FAILURES_TOTAL.inc();
                                         error!("Failed to process service: {}", e);
                                     }
                                     if let Err(e) = process_firewall_group(&service, &cli.firewall_group_label, &unifi_client).await {
+                                        RECONCILIATION_FAILURES_TOTAL.inc();
                                         error!("Failed to process firewall group for service: {}", e);
                                     }
                                 },
@@ -428,7 +474,7 @@ async fn main() -> Result<()> {
 }
 
 #[cfg(test)]
-mod main_tests {
+mod tests {
     use super::*;
     use crate::unifi::MockHttpClient;
     use http;
