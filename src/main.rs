@@ -89,20 +89,12 @@ async fn process_firewall_group(
 ) -> Result<()> {
     SERVICES_SEEN_TOTAL.inc();
 
-    match service.labels() {
-        Some(labels) => {
-            if !labels.contains_key(label) {
-                debug!(
-                    "Skipping service {:?} without firewall group label",
-                    service
-                );
-                return Ok(());
-            }
-        }
-        None => {
-            debug!("Skipping service {:?} without labels", service);
-            return Ok(());
-        }
+    if !service.labels().map_or(false, |l| l.contains_key(label)) {
+        debug!(
+            "Skipping service {:?} without firewall group label",
+            service
+        );
+        return Ok(());
     }
     SERVICES_PROCESSED_TOTAL.inc();
 
@@ -188,17 +180,9 @@ async fn process_port_forwards(
     SERVICES_SEEN_TOTAL.inc();
     debug!("Checking service for port forwards: {:?}", service);
 
-    match service.labels() {
-        Some(labels) => {
-            if !labels.contains_key(label) {
-                debug!("Skipping service {:?} without port forward label", service);
-                return Ok(());
-            }
-        }
-        None => {
-            debug!("Skipping service {:?} without labels", service);
-            return Ok(());
-        }
+    if !service.labels().map_or(false, |l| l.contains_key(label)) {
+        debug!("Skipping service {:?} without port forward label", service);
+        return Ok(());
     }
     SERVICES_PROCESSED_TOTAL.inc();
 
@@ -289,26 +273,26 @@ async fn cleanup_unmatched_resources(
     firewall_group_label: &str,
     unifi_interface: &str,
 ) -> Result<()> {
-    let mut desired_rules = HashSet::new();
-    let mut desired_groups = HashSet::new();
+    let desired_rules: HashSet<String> = services
+        .iter()
+        .filter(|service| service.labels().map_or(false, |l| l.contains_key(label)))
+        .flat_map(|service| {
+            futures::executor::block_on(service.port_forward_rules(unifi_interface))
+                .unwrap_or_default()
+        })
+        .map(|rule| rule.name)
+        .collect();
 
-    for service in services {
-        if let Some(labels) = service.labels() {
-            if labels.iter().any(|(key, _)| key.contains(label)) {
-                for rule in service.port_forward_rules(unifi_interface).await? {
-                    desired_rules.insert(rule.name);
-                }
-            }
-            if labels
-                .iter()
-                .any(|(key, _)| key.contains(firewall_group_label))
-            {
-                for group in service.firewall_groups().await? {
-                    desired_groups.insert(group.name);
-                }
-            }
-        }
-    }
+    let desired_groups: HashSet<String> = services
+        .iter()
+        .filter(|service| {
+            service
+                .labels()
+                .map_or(false, |l| l.contains_key(firewall_group_label))
+        })
+        .flat_map(|service| futures::executor::block_on(service.firewall_groups()).unwrap_or_default())
+        .map(|group| group.name)
+        .collect();
 
     let port_forward_rules = unifi::PortForwardRule::list(unifi_client).await?;
     for rule in &port_forward_rules {
