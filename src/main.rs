@@ -89,7 +89,7 @@ async fn process_firewall_group(
 ) -> Result<()> {
     SERVICES_SEEN_TOTAL.inc();
 
-    if !service.labels().map_or(false, |l| l.contains_key(label)) {
+    if !service.labels().is_some_and(|l| l.contains_key(label)) {
         debug!(
             "Skipping service {:?} without firewall group label",
             service
@@ -180,7 +180,7 @@ async fn process_port_forwards(
     SERVICES_SEEN_TOTAL.inc();
     debug!("Checking service for port forwards: {:?}", service);
 
-    if !service.labels().map_or(false, |l| l.contains_key(label)) {
+    if !service.labels().is_some_and(|l| l.contains_key(label)) {
         debug!("Skipping service {:?} without port forward label", service);
         return Ok(());
     }
@@ -275,7 +275,7 @@ async fn cleanup_unmatched_resources(
 ) -> Result<()> {
     let desired_rules: HashSet<String> = services
         .iter()
-        .filter(|service| service.labels().map_or(false, |l| l.contains_key(label)))
+        .filter(|service| service.labels().is_some_and(|l| l.contains_key(label)))
         .flat_map(|service| {
             futures::executor::block_on(service.port_forward_rules(unifi_interface))
                 .unwrap_or_default()
@@ -288,9 +288,11 @@ async fn cleanup_unmatched_resources(
         .filter(|service| {
             service
                 .labels()
-                .map_or(false, |l| l.contains_key(firewall_group_label))
+                .is_some_and(|l| l.contains_key(firewall_group_label))
         })
-        .flat_map(|service| futures::executor::block_on(service.firewall_groups()).unwrap_or_default())
+        .flat_map(|service| {
+            futures::executor::block_on(service.firewall_groups()).unwrap_or_default()
+        })
         .map(|group| group.name)
         .collect();
 
@@ -394,52 +396,62 @@ async fn main() -> Result<()> {
     if cli.watch {
         info!("Watching for service events");
         let wc = watcher::Config::default();
-        let mut stream = watcher(services_api.clone(), wc).boxed();
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut sigterm = signal(SignalKind::terminate())?;
 
-        loop {
-            tokio::select! {
-                service = stream.try_next() => {
-                    match service {
-                        Ok(Some(event)) => {
-                            match event {
-                                watcher::Event::Apply(s) => {
-                                    RECONCILIATIONS_TOTAL.inc();
-                                    let service = Service(s);
-                                    if let Err(e) = process_port_forwards(&service, &cli.label, &unifi_client, &cli.unifi_interface).await {
-                                        RECONCILIATION_FAILURES_TOTAL.inc();
-                                        error!("Failed to process service: {}", e);
-                                    }
-                                    if let Err(e) = process_firewall_group(&service, &cli.firewall_group_label, &unifi_client).await {
-                                        RECONCILIATION_FAILURES_TOTAL.inc();
-                                        error!("Failed to process firewall group for service: {}", e);
-                                    }
-                                },
-                                watcher::Event::Delete(s) => {
-                                    let service = Service(s);
-                                    info!("Service {:?} deleted, cleaning up Unifi resources", service);
-                                    // TODO: This is not ideal, but it's the best we can do for now
-                                    let services = services_api
-                                        .list(&ListParams::default())
-                                        .await?;
-                                    let services: Vec<Service> = services.into_iter().map(Service).collect();
-                                    let _ = cleanup_unmatched_resources(&unifi_client, &services, &cli.label, &cli.firewall_group_label, &cli.unifi_interface).await;
-                                },
-                                _ => debug!("Ignoring other watcher events"),
-                            }
-                        },
-                        Ok(None) => info!("Watcher stream ended"),
-                        Err(e) => error!("Watcher error: {}", e),
+        'watch_loop: loop {
+            let mut stream = watcher(services_api.clone(), wc.clone()).boxed();
+
+            loop {
+                tokio::select! {
+                    service = stream.try_next() => {
+                        match service {
+                            Ok(Some(event)) => {
+                                match event {
+                                    watcher::Event::Apply(s) => {
+                                        RECONCILIATIONS_TOTAL.inc();
+                                        let service = Service(s);
+                                        if let Err(e) = process_port_forwards(&service, &cli.label, &unifi_client, &cli.unifi_interface).await {
+                                            RECONCILIATION_FAILURES_TOTAL.inc();
+                                            error!("Failed to process service: {}", e);
+                                        }
+                                        if let Err(e) = process_firewall_group(&service, &cli.firewall_group_label, &unifi_client).await {
+                                            RECONCILIATION_FAILURES_TOTAL.inc();
+                                            error!("Failed to process firewall group for service: {}", e);
+                                        }
+                                    },
+                                    watcher::Event::Delete(s) => {
+                                        let service = Service(s);
+                                        info!("Service {:?} deleted, cleaning up Unifi resources", service);
+                                        // TODO: This is not ideal, but it's the best we can do for now
+                                        let services = services_api
+                                            .list(&ListParams::default())
+                                            .await?;
+                                        let services: Vec<Service> = services.into_iter().map(Service).collect();
+                                        let _ = cleanup_unmatched_resources(&unifi_client, &services, &cli.label, &cli.firewall_group_label, &cli.unifi_interface).await;
+                                    },
+                                    _ => debug!("Ignoring other watcher events"),
+                                }
+                            },
+                            Ok(None) => {
+                                info!("Watcher stream ended, restarting");
+                                break;
+                            },
+                            Err(e) => {
+                                error!("Watcher error: {}", e);
+                                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                                break;
+                            },
+                        }
+                    },
+                    _ = sigint.recv() => {
+                        info!("Received SIGINT, shutting down");
+                        break 'watch_loop;
                     }
-                },
-                _ = sigint.recv() => {
-                    info!("Received SIGINT, shutting down");
-                    break;
-                }
-                _ = sigterm.recv() => {
-                    info!("Received SIGTERM, shutting down");
-                    break;
+                    _ = sigterm.recv() => {
+                        info!("Received SIGTERM, shutting down");
+                        break 'watch_loop;
+                    }
                 }
             }
         }

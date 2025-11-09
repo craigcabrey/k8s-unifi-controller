@@ -29,7 +29,7 @@ impl Service {
         let service = &self.0;
         let service_ips = match &service.spec {
             Some(spec) => match &spec.external_name {
-                Some(external_name) => resolve_external_name(&external_name).await?,
+                Some(external_name) => resolve_external_name(external_name).await?,
                 None => service
                     .status
                     .as_ref()
@@ -70,7 +70,7 @@ impl Service {
 
         let external_ip = service_ips
             .iter()
-            .find(|ip_str| ip_str.parse::<IpAddr>().map_or(false, |ip| ip.is_ipv4()))
+            .find(|ip_str| ip_str.parse::<IpAddr>().is_ok_and(|ip| ip.is_ipv4()))
             .ok_or(anyhow::anyhow!(
                 "Cannot create port forward rules for service '{:?}': external IP not found for service",
                 self,
@@ -127,7 +127,7 @@ impl Service {
 
         let (ipv4_ips, ipv6_ips): (Vec<String>, Vec<String>) = service_ips
             .into_iter()
-            .partition(|ip_str| ip_str.parse::<IpAddr>().map_or(false, |ip| ip.is_ipv4()));
+            .partition(|ip_str| ip_str.parse::<IpAddr>().is_ok_and(|ip| ip.is_ipv4()));
 
         let mut groups = Vec::new();
 

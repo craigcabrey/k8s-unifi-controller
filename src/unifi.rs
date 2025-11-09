@@ -336,10 +336,12 @@ impl UnifiClient {
         } else {
             let mut headers = header::HeaderMap::new();
             headers.insert("X-API-KEY", header::HeaderValue::from_str(&token).unwrap());
-            Box::new(Client::builder()
-                .default_headers(headers)
-                .danger_accept_invalid_certs(insecure)
-                .build()?)
+            Box::new(
+                Client::builder()
+                    .default_headers(headers)
+                    .danger_accept_invalid_certs(insecure)
+                    .build()?,
+            )
         };
 
         info!("Unifi client created for site '{}'", site_name);
