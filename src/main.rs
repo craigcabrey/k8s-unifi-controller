@@ -329,6 +329,117 @@ async fn cleanup_unmatched_resources(
     Ok(())
 }
 
+struct Context {
+    unifi_client: unifi::UnifiClient,
+    label: String,
+    firewall_group_label: String,
+    unifi_interface: String,
+}
+
+async fn handle_service_update(service: Service, context: &Context) {
+    if let Err(e) = process_port_forwards(
+        &service,
+        &context.label,
+        &context.unifi_client,
+        &context.unifi_interface,
+    )
+    .await
+    {
+        RECONCILIATION_FAILURES_TOTAL.inc();
+        error!("Failed to process service: {}", e);
+    }
+    if let Err(e) = process_firewall_group(
+        &service,
+        &context.firewall_group_label,
+        &context.unifi_client,
+    )
+    .await
+    {
+        RECONCILIATION_FAILURES_TOTAL.inc();
+        error!("Failed to process firewall group for service: {}", e);
+    }
+}
+
+async fn handle_service_delete(
+    service: Service,
+    services_api: &Api<k8s_openapi::api::core::v1::Service>,
+    context: &Context,
+) {
+    info!("Service {:?} deleted, cleaning up Unifi resources", service);
+    // TODO: This is not ideal, but it's the best we can do for now
+    let services_result = services_api.list(&ListParams::default()).await;
+
+    if let Ok(services) = services_result {
+        let services: Vec<Service> = services.into_iter().map(Service).collect();
+        if let Err(e) = cleanup_unmatched_resources(
+            &context.unifi_client,
+            &services,
+            &context.label,
+            &context.firewall_group_label,
+            &context.unifi_interface,
+        )
+        .await
+        {
+            error!("Failed to cleanup resources: {}", e);
+        }
+    } else if let Err(e) = services_result {
+        error!("Failed to list services for cleanup: {}", e);
+    }
+}
+
+async fn watch(
+    services_api: Api<k8s_openapi::api::core::v1::Service>,
+    context: &Context,
+) -> Result<()> {
+    info!("Watching for service events");
+    let wc = watcher::Config::default();
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+
+    'watch_loop: loop {
+        let mut stream = watcher(services_api.clone(), wc.clone()).boxed();
+
+        loop {
+            tokio::select! {
+                service = stream.try_next() => {
+                    match service {
+                        Ok(Some(event)) => {
+                            match event {
+                                watcher::Event::Apply(s) => {
+                                    RECONCILIATIONS_TOTAL.inc();
+                                    handle_service_update(Service(s), context).await;
+                                },
+                                watcher::Event::Delete(s) => {
+                                    handle_service_delete(Service(s), &services_api, context).await;
+                                },
+                                _ => debug!("Ignoring other watcher events"),
+                            }
+                        },
+                        Ok(None) => {
+                            info!("Watcher stream ended, restarting");
+                            break;
+                        },
+                        Err(e) => {
+                            error!("Watcher error: {}", e);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                            break;
+                        },
+                    }
+                },
+                _ = sigint.recv() => {
+                    info!("Received SIGINT, shutting down");
+                    break 'watch_loop;
+                }
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM, shutting down");
+                    break 'watch_loop;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -367,6 +478,13 @@ async fn main() -> Result<()> {
 
     info!("Unifi client configured");
 
+    let context = Context {
+        unifi_client,
+        label: cli.label.clone(),
+        firewall_group_label: cli.firewall_group_label.clone(),
+        unifi_interface: cli.unifi_interface.clone(),
+    };
+
     let services_api: Api<k8s_openapi::api::core::v1::Service> = Api::all(client);
     let services: Vec<Service> = services_api
         .list(&ListParams::default())
@@ -378,91 +496,19 @@ async fn main() -> Result<()> {
     info!("Processing all services once");
     RECONCILIATIONS_TOTAL.inc();
     for service in &services {
-        if let Err(e) =
-            process_port_forwards(service, &cli.label, &unifi_client, &cli.unifi_interface).await
-        {
-            RECONCILIATION_FAILURES_TOTAL.inc();
-            error!("Error occurred while processing port forwards: {:?}", e)
-        };
-
-        if let Err(e) =
-            process_firewall_group(service, &cli.firewall_group_label, &unifi_client).await
-        {
-            RECONCILIATION_FAILURES_TOTAL.inc();
-            error!("Error occurred while processing firewall group: {:?}", e)
-        };
+        handle_service_update(service.clone(), &context).await;
     }
 
     if cli.watch {
-        info!("Watching for service events");
-        let wc = watcher::Config::default();
-        let mut sigint = signal(SignalKind::interrupt())?;
-        let mut sigterm = signal(SignalKind::terminate())?;
-
-        'watch_loop: loop {
-            let mut stream = watcher(services_api.clone(), wc.clone()).boxed();
-
-            loop {
-                tokio::select! {
-                    service = stream.try_next() => {
-                        match service {
-                            Ok(Some(event)) => {
-                                match event {
-                                    watcher::Event::Apply(s) => {
-                                        RECONCILIATIONS_TOTAL.inc();
-                                        let service = Service(s);
-                                        if let Err(e) = process_port_forwards(&service, &cli.label, &unifi_client, &cli.unifi_interface).await {
-                                            RECONCILIATION_FAILURES_TOTAL.inc();
-                                            error!("Failed to process service: {}", e);
-                                        }
-                                        if let Err(e) = process_firewall_group(&service, &cli.firewall_group_label, &unifi_client).await {
-                                            RECONCILIATION_FAILURES_TOTAL.inc();
-                                            error!("Failed to process firewall group for service: {}", e);
-                                        }
-                                    },
-                                    watcher::Event::Delete(s) => {
-                                        let service = Service(s);
-                                        info!("Service {:?} deleted, cleaning up Unifi resources", service);
-                                        // TODO: This is not ideal, but it's the best we can do for now
-                                        let services = services_api
-                                            .list(&ListParams::default())
-                                            .await?;
-                                        let services: Vec<Service> = services.into_iter().map(Service).collect();
-                                        let _ = cleanup_unmatched_resources(&unifi_client, &services, &cli.label, &cli.firewall_group_label, &cli.unifi_interface).await;
-                                    },
-                                    _ => debug!("Ignoring other watcher events"),
-                                }
-                            },
-                            Ok(None) => {
-                                info!("Watcher stream ended, restarting");
-                                break;
-                            },
-                            Err(e) => {
-                                error!("Watcher error: {}", e);
-                                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                                break;
-                            },
-                        }
-                    },
-                    _ = sigint.recv() => {
-                        info!("Received SIGINT, shutting down");
-                        break 'watch_loop;
-                    }
-                    _ = sigterm.recv() => {
-                        info!("Received SIGTERM, shutting down");
-                        break 'watch_loop;
-                    }
-                }
-            }
-        }
+        watch(services_api.clone(), &context).await?;
     }
 
     cleanup_unmatched_resources(
-        &unifi_client,
+        &context.unifi_client,
         &services,
-        &cli.label,
-        &cli.firewall_group_label,
-        &cli.unifi_interface,
+        &context.label,
+        &context.firewall_group_label,
+        &context.unifi_interface,
     )
     .await?;
 
