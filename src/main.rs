@@ -391,12 +391,12 @@ async fn watch(
     services_api: Api<k8s_openapi::api::core::v1::Service>,
     context: &Context,
 ) -> Result<()> {
-    info!("Watching for service events");
     let wc = watcher::Config::default();
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
 
     'watch_loop: loop {
+        info!("Watching for service events");
         let mut stream = watcher(services_api.clone(), wc.clone()).boxed();
 
         loop {
